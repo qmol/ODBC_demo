@@ -32,11 +32,18 @@ void ODBC_error(                 /* Get and print ODBC error messages */
     SQLINTEGER nativeerr;
     SQLSMALLINT actualmsglen;
     RETCODE rc;
+
+    /* ==============================================
+    **   Note that SQLGetDiagRec is the preferred
+    **   function for retrieving ODBC error
+    **   messages.  SQLError is used here for
+    **   backward compatibility with ODBC 2.x.
+    ** ============================================== */
 loop:
-    rc = SQLError(henv, hdbc, hstmt,
+    rc = SQLError((SQLHENV )henv, (SQLHDBC )hdbc, (SQLHSTMT )hstmt,
                   (SQLCHAR *)sqlstate, &nativeerr, (SQLCHAR *)errmsg,
                   SQL_MAX_MESSAGE_LENGTH - 1, &actualmsglen);
-    if (rc == SQL_ERROR)
+    if (rc == SQL_ERROR || rc == SQL_INVALID_HANDLE)
     {
         printf("SQLError failed!\n");
         return;
@@ -60,9 +67,10 @@ loop:
 ** Arguments: henv    _ environment handle
 **    hdbc    - connection to handle
 */
-void EnvClose(SQLHANDLE henv, SQLHANDLE hdbc)
+void EnvClose(SQLHANDLE henv, SQLHANDLE hdbc, SQLHANDLE hstmt)
 {
     SQLDisconnect(hdbc);
+    SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
     SQLFreeHandle(SQL_HANDLE_DBC, hdbc);
     SQLFreeHandle(SQL_HANDLE_ENV, henv);
 }
@@ -95,6 +103,11 @@ char *fgets_wrapper(char *buffer, size_t buflen)
 **
 ** Purpose: ODBC Demo routine.
 */
+
+/*
+** In many current systems type "SQLLEN" is the same as "long",
+** but this is not always the case.
+*/
 typedef struct
 {
     UCHAR charCol1[1024];
@@ -103,23 +116,23 @@ typedef struct
     short length2;
 } DataInfoStruct;
 
-DataInfoStruct dataStruct[32];
-DataInfoStruct dataStruct2[32];
-DataInfoStruct dataStruct3[32];
-
-
 int main(int argc, char *argv[])
 {
-    SQLHANDLE hdbc;
-    SQLHANDLE henv;
-    SQLHANDLE hstmt;
+    SQLHANDLE hdbc = SQL_NULL_HANDLE;
+    SQLHANDLE henv = SQL_NULL_HANDLE;
+    SQLHANDLE hstmt = SQL_NULL_HANDLE;
 
-    RETCODE rc;
-    UCHAR uid[UID_LEN];
-    UCHAR pwd[PWD_LEN];
-    UCHAR driver[DSN_LEN];
-    UCHAR ver[32];
-    SQLSMALLINT strLen;
+    RETCODE rc = 0;
+    UCHAR uid[UID_LEN] = {0};
+    UCHAR pwd[PWD_LEN] = {0};
+    UCHAR dsn[DSN_LEN] = {0};
+    UCHAR ver[32] = {0};
+    SQLSMALLINT strLen = 0;
+
+    DataInfoStruct dataStruct[32]  = {0};
+    DataInfoStruct dataStruct2[32] = {0};
+    DataInfoStruct dataStruct3[32] = {0};
+
     int i;
     uid[0] = 0;
     pwd[0] = 0;
@@ -129,99 +142,156 @@ int main(int argc, char *argv[])
         return (1);
     }
     printf("\nEnter the DSN : ");
-    fgets_wrapper((char *)driver, DSN_LEN);
+    fgets_wrapper((char *)dsn, DSN_LEN-1);
     printf("\nEnter the UID : ");
-    fgets_wrapper((char *)uid, UID_LEN);
+    fgets_wrapper((char *)uid, UID_LEN-1);
     printf("\nEnter the PWD : ");
-    fgets_wrapper((char *)pwd, PWD_LEN);
+    fgets_wrapper((char *)pwd, PWD_LEN-1);
     printf("%s: will connect to data source '%s' as user '%s/%s'.\n",
-           argv[0], driver, uid, pwd);
+           argv[0], dsn, uid, pwd);
+
+    // Allocate environment handle
     rc = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &henv);
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("Unable to allocate environment\n");
         exit(255);
     }
+
+    // Set ODBC version
     rc = SQLSetEnvAttr(henv,
                        SQL_ATTR_ODBC_VERSION,
                        (SQLPOINTER)SQL_OV_ODBC3,
                        SQL_IS_INTEGER);
-    rc = SQLConnect(hdbc, (SQLCHAR *)uid, SQL_NTS, (SQLCHAR *)pwd, SQL_NTS);
+    if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
+    {
+        printf("SQLSetEnvAttr: Failed...\n");
+        ODBC_error(henv, SQL_NULL_HDBC, SQL_NULL_HANDLE);
+        SQLFreeHandle(SQL_HANDLE_ENV, henv);
+        exit(255);
+    }
+
+    // Allocate connection handle
+    rc = SQLAllocHandle(SQL_HANDLE_DBC, henv, &hdbc);
+    if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
+    {
+        printf("Unable to allocate connection handle\n");
+        SQLFreeHandle(SQL_HANDLE_ENV, henv);
+        exit(255);
+    }
+
+    // Connect to the DSN
+    rc = SQLConnect(hdbc, (SQLCHAR *)dsn, SQL_NTS, 
+                    (SQLCHAR *)uid, SQL_NTS, 
+                    (SQLCHAR *)pwd, SQL_NTS);
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("SQLConnect: Failed...\n");
-        ODBC_error(henv, hdbc, SQL_NULL_HSTMT);
+        ODBC_error(henv, hdbc, SQL_NULL_HANDLE);
+        SQLFreeHandle(SQL_HANDLE_ENV, henv);
         exit(255); /* Exit with failure */
     }
+
+    // Allocate statement handle
     rc = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("Unable to Allocate a SQLHANDLE:\n");
-        ODBC_error(henv, hdbc, hstmt);
-        EnvClose(henv, hdbc);
+        ODBC_error(henv, hdbc, SQL_NULL_HANDLE);
+        EnvClose(henv, hdbc, SQL_NULL_HANDLE);
         exit(255);
     }
+
+    // Get DBMS driver version
     rc = SQLGetInfo(hdbc, SQL_DRIVER_VER, (SQLPOINTER)ver, sizeof(ver), &strLen);
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("SQLGetInfo has Failed. RC=%d\n", rc);
         ODBC_error(henv, hdbc, hstmt);
+        EnvClose(henv, hdbc, hstmt);
+        exit(255);
     }
     printf("Driver version: %s\n", ver);
 
-    printf("Calling SQLGetTypeInfo...\n");
+    // Get DBMS data type info
     rc = SQLGetTypeInfo((SQLHSTMT)hstmt, SQL_ALL_TYPES);
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("SQLGetTypeInfo has Failed. RC=%d\n", rc);
         ODBC_error(henv, hdbc, hstmt);
-        EnvClose(henv, hdbc);
+        EnvClose(henv, hdbc, hstmt);
         exit(255);
     }
-    rc = SQLBindCol(hstmt, 1, SQL_C_CHAR,
-                    &dataStruct[0].charCol1[0],
-                    (SDWORD)sizeof(dataStruct[0].charCol1),
+
+    // Prepare and execute SQL query
+    const char* query = "SELECT * FROM your_table_name";
+
+    rc = SQLExecDirect((SQLHSTMT)hstmt, (SQLCHAR*)query, SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        printf("SQLExecDirect has Failed. RC=%d\n", rc);
+        ODBC_error(henv, hdbc, hstmt);
+        EnvClose(henv, hdbc, hstmt);
+        exit(255);
+    }
+
+    // Bind columns to program variables
+    rc = SQLBindCol((SQLHSTMT)hstmt, 1, SQL_C_CHAR,
+                    &(dataStruct[0].charCol1[0]),
+                    (SQLLEN)sizeof(dataStruct[0].charCol1),
                     (SQLLEN *)&dataStruct[0].length1);
+
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("SQLBindCol(1) has Failed. RC=%d\n", rc);
         ODBC_error(henv, hdbc, hstmt);
-        EnvClose(henv, hdbc);
+        EnvClose(henv, hdbc, hstmt);
         exit(255);
     }
-    rc = SQLBindCol(hstmt, 4, SQL_C_CHAR,
-                    &dataStruct2[0].charCol1[0],
-                    (SDWORD)sizeof(dataStruct2[0].charCol1),
+
+    rc = SQLBindCol((SQLHSTMT)hstmt, 4, SQL_C_CHAR,
+                    &(dataStruct2[0].charCol1[0]),
+                    (SQLLEN)sizeof(dataStruct2[0].charCol1),
                     (SQLLEN *)&dataStruct2[0].length1);
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("SQLBindCol(4) has Failed. RC=%d\n", rc);
         ODBC_error(henv, hdbc, hstmt);
-        EnvClose(henv, hdbc);
+        EnvClose(henv, hdbc, hstmt);
         exit(255);
     }
-    rc = SQLBindCol(hstmt, 5, SQL_C_CHAR,
-                    &dataStruct3[0].charCol1[0],
-                    (SDWORD)sizeof(dataStruct3[0].charCol1),
+
+    rc = SQLBindCol((SQLHSTMT)hstmt, 5, SQL_C_CHAR,
+                    &(dataStruct3[0].charCol1[0]),
+                    (SQLLEN)sizeof(dataStruct3[0].charCol1),
                     (SQLLEN *)&dataStruct3[0].length1);
     if ((rc != SQL_SUCCESS) && (rc != SQL_SUCCESS_WITH_INFO))
     {
         printf("SQLBindCol(5) has Failed. RC=%d\n", rc);
         ODBC_error(henv, hdbc, hstmt);
-        EnvClose(henv, hdbc);
+        EnvClose(henv, hdbc, hstmt);
         exit(255);
     }
+
     // Set to bogus
     dataStruct[0].length1 = -1;
     dataStruct2[0].length1 = -1;
     dataStruct3[0].length1 = -1;
     int count = 0;
     printf("Fetching result set...\n");
-    while (SQLFetch(hstmt) == SQL_SUCCESS)
+    while ((rc=SQLFetch(hstmt)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO)
     {
-        char *ptr;
         if (count == 0)
         {
+            /* ======================================
+            **  In the new ODBC 3.x spec, the length
+            **  or indicator buffer is used to detect
+            **  NULL data.  If the column is NULL,
+            **  the length/indicator buffer is set to
+            **  SQL_NULL_DATA.
+            ** ====================================== 
+            */
+            char *ptr;
+
             printf("LITERAL PREFIX\n");
             printf("indicator(d): %d\n", dataStruct2[0].length1);
             printf("indicator(lld): %lld\n", dataStruct2[0].length1);
@@ -236,6 +306,7 @@ int main(int argc, char *argv[])
             printf("\n");
             printf("%-32s\n\n", dataStruct2[0].length1 == SQL_NULL_DATA ? (UCHAR *)"NULL"
                                                                         : dataStruct2[0].charCol1);
+
             printf("LITERAL SUFFIX\n");
             printf("indicator(d): %d\n", dataStruct3[0].length1);
             printf("indicator(lld): %lld\n", dataStruct3[0].length1);
@@ -249,18 +320,19 @@ int main(int argc, char *argv[])
             printf("\n");
             printf("%-32s\n\n", dataStruct3[0].length1 == SQL_NULL_DATA ? (UCHAR *)"NULL"
                                                                         : dataStruct3[0].charCol1);
+
+            printf("indicator(d): %d\n", dataStruct[0].length1);
+            printf("indicator(lld): %lld\n", dataStruct[0].length1);
+            printf("indicator(hex):  ");
+            /* assign to char so we can dump out each byte */
+            ptr = (char *)&dataStruct[0].length1;
+            for (i = 0; i < 8; i++)
+            {
+                printf("%x", ptr[i]);
+            }
+            printf("\n");
+            printf("%-32s\n\n", dataStruct[0].length1 == SQL_NULL_DATA ? (UCHAR *)"NULL" : dataStruct[0].charCol1);
         }
-        printf("indicator(d): %d\n", dataStruct[0].length1);
-        printf("indicator(lld): %lld\n", dataStruct[0].length1);
-        printf("indicator(hex):  ");
-        /* assign to char so we can dump out each byte */
-        ptr = (char *)&dataStruct[0].length1;
-        for (i = 0; i < 8; i++)
-        {
-            printf("%x", ptr[i]);
-        }
-        printf("\n");
-        printf("%-32s\n\n", dataStruct[0].length1 == SQL_NULL_DATA ? (UCHAR *)"NULL" : dataStruct[0].charCol1);
 
         dataStruct[0].length1 = -1;
         dataStruct2[0].length1 = -1;
@@ -283,6 +355,6 @@ int main(int argc, char *argv[])
 ** Free Bind Buffers
 */
 end:
-    rc = SQLFreeStmt(hstmt, SQL_UNBIND);
-    EnvClose(henv, hdbc);
+    EnvClose(henv, hdbc, hstmt);
+    exit (0);
 }
